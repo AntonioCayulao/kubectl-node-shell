@@ -20,7 +20,8 @@ pod_linux_name="${KUBECTL_NODE_SHELL_LINUX_POD_NAME:-nsenter}"
 image_pull_secret_name="${KUBECTL_NODE_SHELL_IMAGE_PULL_SECRET_NAME}"
 kyverno_namespace="${KYVERNO_NS:-kyverno}"
 kyverno_release_name="${KYVERNO_RELEASE_NAME:-kyverno-kyverno}"
-kyverno_policy_exception"${KYVERNO_PATH_TO_POLICY_EXCEPTION:-policy-exception.yaml}"
+kyverno_chart_name="${KYVERNO_CHART_NAME:-kyverno/kyverno}"
+kyverno_policy_exception="${KYVERNO_PATH_TO_POLICY_EXCEPTION:-policy-exception.yaml}"
 
 if [ -t 0 ]; then
   tty=true
@@ -102,7 +103,7 @@ if [ -z "$KUBERNETES_PORT" ]; then
 fi
 
 # Check the node and retrieve the node OS label
-os="$($kubectl get node $node -o jsonpath="{.metadata.labels.kubernetes\.io/os}" || exit 1)"
+os="$($kubectl get node "$node" -o jsonpath="{.metadata.labels.kubernetes\.io/os}" || exit 1)"
 
 # Set pod configuration per operating system
 if [ "$os" = "windows" ]; then
@@ -199,15 +200,15 @@ fi
 trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; exit \$EC" EXIT INT TERM
 
 echo "Detecting if kyverno is installed on the cluster..."
-STATUS_KYVERNO=$($helm status -n "${kyverno_namespace}" "${kyverno_release_name}" -o json | jq .info.status)
-if [ STATUS_KYVERNO -eq "deployed" ]; then
+STATUS_KYVERNO=$($helm status -n "${kyverno_namespace}" "${kyverno_release_name}" -o json | jq -r .info.status)
+if [ "${STATUS_KYVERNO}" = "deployed" ]; then
   echo "kyverno detected!"
   echo "Allowing policy exceptions..."
-  $helm upgrade --wait --wait-for-jobs -n "${kyverno_namespace}" "${kyverno_release_name}" --reuse-values --set features.policyExceptions.enabled=true
-  $kubectl apply -f "${kyverno_policy_exception}"
+  $helm upgrade --reuse-values --set features.policyExceptions.enabled=true -n "${kyverno_namespace}" "${kyverno_release_name}" "${kyverno_chart_name}" --wait --wait-for-jobs
+  $kubectl_binary apply -f "${kyverno_policy_exception}"
 else
   echo "Kyverno isn't installed on the cluster."
 fi
 
 echo "spawning \"$pod\" on \"$node\"" >&2
-$kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" --pod-running-timeout="$pod_running_timeout" $([ "$tty" = true ] && echo -t) -i "$pod" $generator
+$kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" --pod-running-timeout="$pod_running_timeout" "$([ "$tty" = true ] && echo -t)" -i "$pod" "$generator"
