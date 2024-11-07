@@ -1,8 +1,10 @@
 #!/usr/bin/env sh
 set -e
 
-kubectl=kubectl
-version=1.10.0
+kubectl="$(which kubectl)"
+kubectl_binary="$(which kubectl)"
+helm="$(which helm)"
+version=1.10.1-ds
 generator=""
 node=""
 nodefaultctx=0
@@ -14,6 +16,11 @@ volume_mounts="[]"
 x_mode=0
 labels="${KUBECTL_NODE_SHELL_LABELS}"
 pod_running_timeout="${KUBECTL_NODE_SHELL_POD_RUNNING_TIMEOUT:-1m}"
+pod_linux_name="{KUBECTL_NODE_SHELL_LINUX_POD_NAME:-nsenter}"
+image_pull_secret_name="${KUBECTL_NODE_SHELL_IMAGE_PULL_SECRET_NAME}"
+kyverno_namespace="${KYVERNO_NS:-kyverno}"
+kyverno_release_name="${KYVERNO_RELEASE_NAME:-kyverno-kyverno}"
+kyverno_policy_exception"${KYVERNO_PATH_TO_POLICY_EXCEPTION:-policy-exception.yaml}"
 
 if [ -t 0 ]; then
   tty=true
@@ -41,11 +48,13 @@ while [ $# -gt 0 ]; do
     ;;
   --kubeconfig)
     kubectl="$kubectl --kubeconfig $2"
+    helm="$helm --kubeconfig $2"
     shift
     shift
     ;;
   --kubeconfig=*)
     kubectl="$kubectl --kubeconfig=${key##*=}"
+    helm="$helm --kubeconfig=${key##*=}"
     shift
     ;;
   -n | --namespace)
@@ -106,7 +115,7 @@ if [ "$os" = "windows" ]; then
   security_context='{"privileged":true,"windowsOptions":{"hostProcess":true,"runAsUserName":"NT AUTHORITY\\SYSTEM"}}'
 else # If the OS isn't windows, assume linux
   image="${KUBECTL_NODE_SHELL_IMAGE:-docker.io/library/alpine}"
-  name="nsenter"
+  name="${pod_linux_name}"
   pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
   cmd_start='"nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid"'
   cmd_arg_prefix=', "--"'
@@ -145,6 +154,12 @@ resources_json='"resources": {
         }'
 $kubectl run --image "$image" "$pod" --dry-run=server 2>&1 | grep -q 'failed quota' || resources_json='"resources": {}'
 
+if [ -n "${image_pull_secret_name}" ]; then
+  image_pull_secrets='[ { "name": "'${image_pull_secret_name}'" } ]'
+else
+  image_pull_secrets='null'
+fi
+
 overrides="$(
 cat <<EOT
 {
@@ -152,6 +167,7 @@ cat <<EOT
     "nodeName": "$node",
     "hostPID": true,
     "hostNetwork": true,
+    "imagePullSecrets": $image_pull_secrets,
     "containers": [
       {
         "securityContext": $security_context,
@@ -175,12 +191,23 @@ cat <<EOT
 EOT
 )"
 # Support Kubectl <1.18
-m=$(kubectl version --client -o yaml | awk -F'[ :"]+' '$2 == "minor" {print $3+0}')
+m=$($kubectl_binary version --client -o yaml | awk -F'[ :"]+' '$2 == "minor" {print $3+0}')
 if [ "$m" -lt 18 ]; then
   generator="--generator=run-pod/v1"
 fi
 
 trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; exit \$EC" EXIT INT TERM
+
+echo "Detecting if kyverno is installed on the cluster..."
+STATUS_KYVERNO=$($helm status -n "${kyverno_namespace}" "${kyverno_release_name}" -o json | jq .info.status)
+if [ STATUS_KYVERNO -eq "deployed" ]; then
+  echo "kyverno detected!"
+  echo "Allowing policy exceptions..."
+  $helm upgrade --wait --wait-for-jobs -n "${kyverno_namespace}" "${kyverno_release_name}" --reuse-values --set features.policyExceptions.enabled=true
+  $kubectl apply -f "${kyverno_policy_exception}"
+else
+  echo "Kyverno isn't installed on the cluster."
+fi
 
 echo "spawning \"$pod\" on \"$node\"" >&2
 $kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" --pod-running-timeout="$pod_running_timeout" $([ "$tty" = true ] && echo -t) -i "$pod" $generator
