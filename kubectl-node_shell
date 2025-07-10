@@ -213,7 +213,7 @@ cat <<EOT
 {
   "metadata": {
     "annotations": {
-      "ad.datadoghq.com/alpine.logs": "[{\n  \"source\": \"alpine\",\n  \"service\": \"alpine\",\n  \"log_processing_rules\": [{\n    \"type\": \"exclude_at_match\",\n    \"name\": \"exclude_pods_logs\",\n    \"pattern\" : \"*\"\n  }]\n}]"
+      "ad.datadoghq.com/nsenter.logs": "[{\n  \"source\": \"alpine\",\n  \"service\": \"alpine\",\n  \"log_processing_rules\": [{\n    \"type\": \"exclude_at_match\",\n    \"name\": \"exclude_pods_logs\",\n    \"pattern\" : \"*\"\n  }]\n}]"
     }
   },
   "spec": {
