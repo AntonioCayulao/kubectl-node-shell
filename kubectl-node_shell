@@ -1,10 +1,9 @@
 #!/usr/bin/env sh
 set -e
 
-kubectl="$(which kubectl)"
-kubectl_binary="$(which kubectl)"
-helm="$(which helm)"
-version=1.10.1-ds
+kubectl=/var/lib/rancher/rke2/bin/kubectl
+version=1.11.0
+generator=""
 node=""
 nodefaultctx=0
 nodefaultns=0
@@ -12,15 +11,16 @@ container_cpu="${KUBECTL_NODE_SHELL_POD_CPU:-100m}"
 container_memory="${KUBECTL_NODE_SHELL_POD_MEMORY:-256Mi}"
 volumes="[]"
 volume_mounts="[]"
-x_mode=0
+x_mode=false
 labels="${KUBECTL_NODE_SHELL_LABELS}"
 pod_running_timeout="${KUBECTL_NODE_SHELL_POD_RUNNING_TIMEOUT:-1m}"
-pod_linux_name="${KUBECTL_NODE_SHELL_LINUX_POD_NAME:-nsenter}"
-image_pull_secret_name="${KUBECTL_NODE_SHELL_IMAGE_PULL_SECRET_NAME:-regcred-image-pull-secret}"
-kyverno_namespace="${KYVERNO_NS:-kyverno}"
-kyverno_release_name="${KYVERNO_RELEASE_NAME:-kyverno-kyverno}"
-kyverno_chart_name="${KYVERNO_CHART_NAME:-kyverno/kyverno}"
-kyverno_policy_exception="${KYVERNO_PATH_TO_POLICY_EXCEPTION:-policy-exception.yaml}"
+image_pull_secret_name="${KUBECTL_NODE_SHELL_IMAGE_PULL_SECRET_NAME}"
+custom_image=""
+use_ipc=true
+use_mount=true
+use_pid=true
+use_net=true
+use_uts=true
 
 if [ -t 0 ]; then
   tty=true
@@ -38,27 +38,21 @@ while [ $# -gt 0 ]; do
   --context)
     nodefaultctx=1
     kubectl="$kubectl --context $2"
-    kubectl_binary="$kubectl_binary --context $2"
     shift
     shift
     ;;
   --kubecontext=*)
     nodefaultctx=1
     kubectl="$kubectl --context=${key##*=}"
-    kubectl_binary="$kubectl_binary --context=${key##*=}"
     shift
     ;;
   --kubeconfig)
     kubectl="$kubectl --kubeconfig $2"
-    kubectl_binary="$kubectl_binary --kubeconfig $2"
-    helm="$helm --kubeconfig $2"
     shift
     shift
     ;;
   --kubeconfig=*)
     kubectl="$kubectl --kubeconfig=${key##*=}"
-    kubectl_binary="$kubectl_binary --kubeconfig=${key##*=}"
-    helm="$helm --kubeconfig=${key##*=}"
     shift
     ;;
   -n | --namespace)
@@ -72,10 +66,41 @@ while [ $# -gt 0 ]; do
     kubectl="$kubectl --namespace=${key##*=}"
     shift
     ;;
+  -m | --mount)
+    volumes=$(echo "$volumes" | jq '. += [{"persistentVolumeClaim": {"claimName": "'"$2"'", "type": ""}, "name": "'"pvc"'"}]')
+    volume_mounts=$(echo "$volume_mounts" | jq '. += [{"mountPath": "/opt-pvc", "name": "'"pvc"'"}]')
+    shift
+    shift
+    ;;
   -x)
-    x_mode=1
-    volumes='[{"hostPath":{"path":"/","type":""},"name":"host-root"}]'
-    volume_mounts='[{"mountPath":"/host","name":"host-root"}]'
+    x_mode=true
+    volumes=$(echo "$volumes" | jq '. += [{"hostPath": {"path": "/", "type": ""}, "name": "host-root"}]')
+    volume_mounts=$(echo "$volume_mounts" | jq '. += [{"mountPath":"/host","name":"host-root"}]')
+    shift
+    ;;
+  --image)
+    custom_image="$2"
+    shift
+    shift
+    ;;
+  --no-ipc)
+    use_ipc=false
+    shift
+    ;;
+  --no-mount)
+    use_mount=false
+    shift
+    ;;
+  --no-pid)
+    use_pid=false
+    shift
+    ;;
+  --no-net)
+    use_net=false
+    shift
+    ;;
+  --no-uts)
+    use_uts=false
     shift
     ;;
   --)
@@ -106,11 +131,12 @@ if [ -z "$KUBERNETES_PORT" ]; then
 fi
 
 # Check the node and retrieve the node OS label
-os="$($kubectl get node "$node" -o jsonpath="{.metadata.labels.kubernetes\.io/os}" || exit 1)"
+os="$($kubectl get node $node -o jsonpath="{.metadata.labels.kubernetes\.io/os}" || exit 1)"
 
 # Set pod configuration per operating system
 if [ "$os" = "windows" ]; then
-  image="${KUBECTL_NODE_SHELL_IMAGE_WINDOWS:-mcr.microsoft.com/oss/kubernetes/windows-host-process-containers-base-image:v1.0.0}"
+  default_image="mcr.microsoft.com/oss/kubernetes/windows-host-process-containers-base-image:v1.0.0"
+  image="${custom_image:-${KUBECTL_NODE_SHELL_IMAGE_WINDOWS:-$default_image}}"
   name="pwsh"
   pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
   cmd_start='"cmd.exe", "/c", "powershell.exe", "-nol"'
@@ -118,10 +144,28 @@ if [ "$os" = "windows" ]; then
   cmd_default=''
   security_context='{"privileged":true,"windowsOptions":{"hostProcess":true,"runAsUserName":"NT AUTHORITY\\SYSTEM"}}'
 else # If the OS isn't windows, assume linux
-  image="${KUBECTL_NODE_SHELL_IMAGE:-docker.io/library/alpine}"
-  name="${pod_linux_name}"
+  default_image="docker.io/library/alpine"
+  image="${custom_image:-${KUBECTL_NODE_SHELL_IMAGE:-$default_image}}"
+  name="nsenter"
   pod="${name}-$(env LC_ALL=C tr -dc a-z0-9 </dev/urandom | head -c 6)"
-  cmd_start='"nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid"'
+  cmd_start='"nsenter", "--target", "1"'
+  # , "--mount", "--uts", "--ipc", "--net", "--pid"
+  if [ "$use_mount" = true ]; then
+    cmd_start="${cmd_start}, \"--mount\""
+  fi
+  if [ "$use_uts" = true ]; then
+    cmd_start="${cmd_start}, \"--uts\""
+  fi
+  if [ "$use_ipc" = true ]; then
+    cmd_start="${cmd_start}, \"--ipc\""
+  fi
+  if [ "$use_net" = true ]; then
+    cmd_start="${cmd_start}, \"--net\""
+  fi
+  if [ "$use_pid" = true ]; then
+    cmd_start="${cmd_start}, \"--pid\""
+  fi
+
   cmd_arg_prefix=', "--"'
   cmd_default=', "bash", "-l"'
   security_context='{"privileged":true}'
@@ -129,7 +173,7 @@ fi
 
 # Build the container command
 if [ $# -gt 0 ]; then
-  if [ "$x_mode" -eq 1 ]; then
+  if [ "$x_mode" = true ]; then
     cmd='['
   else
     cmd="[ $cmd_start $cmd_arg_prefix,"
@@ -144,7 +188,7 @@ if [ $# -gt 0 ]; then
   done
   cmd="$cmd ]"
 else
-  if [ "$x_mode" = 1 ]; then
+  if [ "$x_mode" = true ]; then
     cmd='null'
   else
     cmd="[ $cmd_start $cmd_default ]"
@@ -167,10 +211,16 @@ fi
 overrides="$(
 cat <<EOT
 {
+  "metadata": {
+    "annotations": {
+      "ad.datadoghq.com/alpine.logs": "[{\n  \"source\": \"alpine\",\n  \"service\": \"alpine\",\n  \"log_processing_rules\": [{\n    \"type\": \"exclude_at_match\",\n    \"name\": \"exclude_pods_logs\",\n    \"pattern\" : \"*\"\n  }]\n}]"
+    }
+  },
   "spec": {
     "nodeName": "$node",
-    "hostPID": true,
-    "hostNetwork": true,
+    "hostPID": $use_pid,
+    "hostIPC": $use_ipc,
+    "hostNetwork": $use_net,
     "imagePullSecrets": $image_pull_secrets,
     "containers": [
       {
@@ -194,19 +244,13 @@ cat <<EOT
 }
 EOT
 )"
-
-trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; $kubectl_binary delete secret -n kyverno --field-selector='type=helm.sh/release.v1' --wait=false >&2 || true; $helm upgrade --reuse-values --set features.policyExceptions.enabled=false -n ${kyverno_namespace} ${kyverno_release_name} ${kyverno_chart_name} || true; exit \$EC" EXIT INT TERM
-
-echo "Detecting if kyverno is installed on the cluster..."
-STATUS_KYVERNO=$($helm status -n "${kyverno_namespace}" "${kyverno_release_name}" -o json | jq -r .info.status)
-if [ "${STATUS_KYVERNO}" = "deployed" ]; then
-  echo "kyverno detected!"
-  echo "Allowing policy exceptions..."
-  $helm upgrade --reuse-values --set features.policyExceptions.enabled=true -n "${kyverno_namespace}" "${kyverno_release_name}" "${kyverno_chart_name}" --wait --wait-for-jobs
-  $kubectl_binary apply -f "${kyverno_policy_exception}"
-else
-  echo "Kyverno isn't installed on the cluster."
+# Support Kubectl <1.18
+m=$($kubectl version --client -o yaml | awk -F'[ :"]+' '$2 == "minor" {print $3+0}')
+if [ "$m" -lt 18 ]; then
+  generator="--generator=run-pod/v1"
 fi
 
+trap "EC=\$?; $kubectl delete pod --wait=false $pod >&2 || true; exit \$EC" EXIT INT TERM
+
 echo "spawning \"$pod\" on \"$node\"" >&2
-$kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" --pod-running-timeout="$pod_running_timeout" "$([ "$tty" = true ] && echo -t)" -i "$pod"
+$kubectl run --image "$image" --restart=Never --overrides="$overrides" --labels="$labels" --pod-running-timeout="$pod_running_timeout" $([ "$tty" = true ] && echo -t) -i "$pod" $generator
